@@ -1,0 +1,33 @@
+// // SPDX-License-Identifier: MIT
+// pragma solidity 0.8.1;
+
+// import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+
+// import "./FakeToken.sol";
+
+// contract HarvestPoolRewardMock {
+//     address public fToken;
+//     address public farmToken;
+
+//     // function stake(uint256 amount) external;
+
+//     //     function withdraw(uint256 amount) external;
+
+//     constructor(address _ftoken, address _farmToken) public {
+//         fToken = _ftoken;
+//         farmToken = _farmToken;
+//     }
+
+//     function stake(uint256 amount) external {
+//         IERC20(fToken).transferFrom(msg.sender, address(this), amount);
+//     }
+
+//     function withdraw(uint256 numberOfShares) external {
+//         IERC20(fToken).transfer(msg.sender, numberOfShares);
+//         FakeToken(farmToken).mint(msg.sender, 10 * (10**18));
+//     }
+
+//     function _calcExtra(uint256 amount) internal view returns (uint256) {
+//         return (amount * 1000) / 10000;
+//     }
+// }

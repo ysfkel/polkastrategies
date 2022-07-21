@@ -1,0 +1,26 @@
+// // SPDX-License-Identifier: MIT
+// pragma solidity 0.8.1;
+
+// import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+
+// import "./FakeToken.sol";
+
+// contract SushiswapRouterMock {
+//     address public token;
+
+//     uint256 public swapRatio = 2;
+
+//     constructor(address _token) public {}
+
+//     function swapExactETHForTokens(
+//         uint256 amountOutMin,
+//         address[] calldata path,
+//         address to,
+//         uint256 deadline
+//     ) external payable returns (uint256[] memory amounts) {
+//         FakeToken(token).mint(msg.sender, msg.value.mul(swapRatio));
+
+//         amounts[0] = msg.value;
+//         amounts[1] = 0;
+//     }
+// }

@@ -1,0 +1,928 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.1;
+
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import "@openzeppelin/contracts/utils/math/SafeMath.sol";
+
+import "../../libraries/ReentrancyGuard.sol";
+
+import "../../interfaces/IForceVault.sol";
+import "../../interfaces/IUniswapRouter.sol";
+import "../../interfaces/IMintNoRewardPool.sol";
+
+import "../../ReceiptToken.sol";
+
+/*
+  |Strategy Flow| 
+      - User shows up with ETH. 
+      - We swap his ETH to DAI/USDC/USDT and then we deposit it in Force's Vault. 
+      - After this we have dToken that we add in Force's Reward Pool which gives FORCE as rewards
+
+    - Withdrawal flow does same thing, but backwards. 
+*/
+contract ForceSC is Ownable, ReentrancyGuard {
+    using SafeERC20 for IERC20;
+    using SafeMath for uint256;
+
+    struct UserDeposits {
+        uint256 timestamp;
+        uint256 amountdToken;
+    }
+
+    /// @notice Info of each user.
+    struct UserInfo {
+        uint256 amountEth; //how much ETH the user entered with
+        uint256 amountToken; //how much Token was obtained by swapping user's ETH
+        uint256 amountdToken; //how much dToken was obtained after deposit to vault
+        uint256 amountReceiptToken; //receipt tokens printed for user; should be equal to amountdToken
+        uint256 underlyingRatio; //ratio between obtained dToken and Token
+        uint256 userTreasuryEth; //how much eth the user sent to treasury
+        uint256 userCollectedFees; //how much eth the user sent to fee address
+        uint256 joinTimestamp; //first deposit timestamp; taken into account for lock time
+        bool wasUserBlacklisted; //if user was blacklist at deposit time, he is not receiving receipt tokens
+        uint256 timestamp; //first deposit timestamp; used for withdrawal lock time check
+        UserDeposits[] deposits;
+        uint256 earnedTokens; //before fees
+        uint256 earnedRewards; //before fees
+    }
+    mapping(address => UserInfo) public userInfo;
+    mapping(address => bool) public blacklisted; //blacklisted users do not receive a receipt token
+
+    uint256 public firstDepositTimestamp; //used to calculate reward per block
+    uint256 public totalDeposits; //total amount of staking token invested
+
+    uint256 public cap = uint256(1000); //eth cap
+    uint256 public totalEth; //total invested eth
+    uint256 public ethPrice; //for UI; to be updated from a script
+
+    uint256 public lockTime = 10368000; //120 days
+
+    address payable public feeAddress;
+    uint256 public fee = uint256(50);
+    uint256 constant feeFactor = uint256(10000);
+
+    ReceiptToken public receiptToken;
+    address public token;
+    address public weth;
+    address public forceToken;
+    address public poolToken;
+    address payable public treasuryAddress;
+    IMintNoRewardPool public rewardPool; //deposit dToken and get Force
+    IForceVault public vault; //deposit Token and get dToken
+    IUniswapRouter public sushiswapRouter;
+
+    uint256 public ethDust;
+    uint256 public treasueryEthDust;
+
+    event ExtraTokensExchanged(
+        address indexed user,
+        uint256 tokensAmount,
+        uint256 obtainedEth
+    );
+    event RewardsExchanged(
+        address indexed user,
+        uint256 rewardsAmount,
+        uint256 obtainedEth
+    );
+    event ObtainedInfo(
+        address indexed user,
+        uint256 underlying,
+        uint256 underlyingReceipt
+    );
+    event RewardsEarned(address indexed user, uint256 amount);
+    event ExtraTokens(address indexed user, uint256 amount);
+    event FeeSet(address indexed sender, uint256 feeAmount);
+    event FeeAddressSet(address indexed sender, address indexed feeAddress);
+
+    /// @notice Event emitted when blacklist status for an address changes
+    event BlacklistChanged(
+        string actionType,
+        address indexed user,
+        bool oldVal,
+        bool newVal
+    );
+    /// @notice Event emitted when user makes a deposit and receipt token is minted
+    event ReceiptMinted(address indexed user, uint256 amount);
+    /// @notice Event emitted when user withdraws and receipt token is burned
+    event ReceiptBurned(address indexed user, uint256 amount);
+
+    /// @notice Event emitted when user makes a deposit
+    event Deposit(
+        address indexed user,
+        address indexed origin,
+        uint256 amountEth,
+        uint256 amountToken,
+        uint256 amountdToken
+    );
+
+    /// @notice Event emitted when user withdraws
+    event Withdraw(
+        address indexed user,
+        address indexed origin,
+        uint256 amountEth,
+        uint256 amountToken,
+        uint256 amountdToken,
+        uint256 treasuryAmountEth
+    );
+
+    /// @notice Event emitted when owner makes a rescue dust request
+    event RescuedDust(string indexed dustType, uint256 amount);
+
+    /// @notice Event emitted when owner changes any contract address
+    event ChangedAddress(
+        string indexed addressType,
+        address indexed oldAddress,
+        address indexed newAddress
+    );
+
+    //internal
+    mapping(address => bool) public approved; //to defend against non whitelisted contracts
+
+    /// @notice Used internally for avoiding "stack-too-deep" error when depositing
+    struct DepositData {
+        address[] swapPath;
+        uint256[] swapAmounts;
+        uint256 obtainedToken;
+        uint256 obtaineddToken;
+        uint256 prevdTokenBalance;
+    }
+
+    /// @notice Used internally for avoiding "stack-too-deep" error when withdrawing
+    struct WithdrawData {
+        uint256 prevDustEthBalance;
+        uint256 prevdTokenBalance;
+        uint256 prevTokenBalance;
+        uint256 obtaineddToken;
+        uint256 obtainedToken;
+        uint256 feeableToken;
+        uint256 totalEth;
+        uint256 feeableEth;
+        uint256 auctionedEth;
+        uint256 rewards;
+        uint256 forceBalance;
+    }
+
+    /**
+     * @notice Create a new contract
+     * @param _vault Vault address
+     * @param _pool NoMintRewardPool address
+     * @param _sushiswapRouter Sushiswap Router address
+     * @param _poolToken Pool's underlying token address
+     * @param _forceToken Force address
+     * @param _token TOKEN address
+     * @param _weth WETH address
+     * @param _treasuryAddress treasury address
+     * @param _receiptToken Receipt token that is minted and burned
+     * @param _feeAddress fee address
+     */
+    constructor(
+        address _vault,
+        address _pool,
+        address _sushiswapRouter,
+        address _poolToken,
+        address _forceToken,
+        address _token,
+        address _weth,
+        address payable _treasuryAddress,
+        address _receiptToken,
+        address payable _feeAddress
+    ) public {
+        require(_vault != address(0), "VAULT_0x0");
+        require(_pool != address(0), "POOL_0x0");
+        require(_sushiswapRouter != address(0), "ROUTER_0x0");
+        require(_poolToken != address(0), "TOKEN_0x0");
+        require(_forceToken != address(0), "FORCE_0x0");
+        require(_token != address(0), "TOKEN_0x0");
+        require(_weth != address(0), "WETH_0x0");
+        require(_treasuryAddress != address(0), "TREASURY_0x0");
+        require(_receiptToken != address(0), "RECEIPT_0x0");
+        require(_feeAddress != address(0), "FEE_0x0");
+
+        vault = IForceVault(_vault);
+        rewardPool = IMintNoRewardPool(_pool);
+        sushiswapRouter = IUniswapRouter(_sushiswapRouter);
+        poolToken = _poolToken;
+        forceToken = _forceToken;
+        token = _token;
+        weth = _weth;
+        treasuryAddress = _treasuryAddress;
+        receiptToken = ReceiptToken(_receiptToken);
+        feeAddress = _feeAddress;
+    }
+
+    //-----------------------------------------------------------------------------------------------------------------//
+    //------------------------------------ Setters -------------------------------------------------//
+    //-----------------------------------------------------------------------------------------------------------------//
+    /**
+     * @notice Update the address of Vault
+     * @dev Can only be called by the owner
+     * @param _vault Address of Vault
+     */
+    function setVault(address _vault) public onlyOwner {
+        require(_vault != address(0), "VAULT_0x0");
+        emit ChangedAddress("VAULT", address(vault), _vault);
+        vault = IForceVault(_vault);
+    }
+
+    /**
+     * @notice Update the address of NoMintRewardPool
+     * @dev Can only be called by the owner
+     * @param _rewardPool Address of NoMintRewardPool
+     */
+    function setRewardPool(address _rewardPool) public onlyOwner {
+        require(_rewardPool != address(0), "POOL_0x0");
+        emit ChangedAddress("POOL", address(rewardPool), _rewardPool);
+        rewardPool = IMintNoRewardPool(_rewardPool);
+    }
+
+    /**
+     * @notice Update the address of Sushiswap Router
+     * @dev Can only be called by the owner
+     * @param _sushiswapRouter Address of Sushiswap Router
+     */
+    function setSushiswapRouter(address _sushiswapRouter) public onlyOwner {
+        require(_sushiswapRouter != address(0), "0x0");
+        emit ChangedAddress(
+            "SUSHISWAP_ROUTER",
+            address(sushiswapRouter),
+            _sushiswapRouter
+        );
+        sushiswapRouter = IUniswapRouter(_sushiswapRouter);
+    }
+
+    /**
+     * @notice Update the address of Pool's underlying token
+     * @dev Can only be called by the owner
+     * @param _poolToken Address of Pool's underlying token
+     */
+    function setPoolToken(address _poolToken) public onlyOwner {
+        require(_poolToken != address(0), "TOKEN_0x0");
+        emit ChangedAddress("TOKEN", poolToken, _poolToken);
+        poolToken = _poolToken;
+    }
+
+    /**
+     * @notice Update the address of FORCE
+     * @dev Can only be called by the owner
+     * @param _forceToken Address of FORCE
+     */
+    function setForceToken(address _forceToken) public onlyOwner {
+        require(_forceToken != address(0), "FORCE_0x0");
+        emit ChangedAddress("FORCE", forceToken, _forceToken);
+        forceToken = _forceToken;
+    }
+
+    /**
+     * @notice Update the address for fees
+     * @dev Can only be called by the owner
+     * @param _feeAddress Fee's address
+     */
+    function setTreasury(address payable _feeAddress) public onlyOwner {
+        require(_feeAddress != address(0), "0x0");
+        emit ChangedAddress(
+            "TREASURY",
+            address(treasuryAddress),
+            address(_feeAddress)
+        );
+        treasuryAddress = _feeAddress;
+    }
+
+    /**
+     * @notice Approve contract (only approved contracts or msg.sender==tx.origin can call this strategy)
+     * @dev Can only be called by the owner
+     * @param account Contract's address
+     */
+    function approveContractAccess(address account) external onlyOwner {
+        require(account != address(0), "0x0");
+        approved[account] = true;
+    }
+
+    /**
+     * @notice Revoke contract's access (only approved contracts or msg.sender==tx.origin can call this strategy)
+     * @dev Can only be called by the owner
+     * @param account Contract's address
+     */
+    function revokeContractAccess(address account) external onlyOwner {
+        require(account != address(0), "0x0");
+        approved[account] = false;
+    }
+    /**
+     * @notice Set max ETH cap for this strategy
+     * @dev Can only be called by the owner
+     * @param _cap ETH amount
+     */
+    function setCap(uint256 _cap) external onlyOwner {
+        cap = _cap;
+    }
+
+    /**
+     * @notice Set ETH price
+     * @dev Can only be called by the owner
+     * @param _price ETH price
+     */
+    function setEthPrice(uint256 _price) external onlyOwner {
+        require(_price > 0, "PRICE_0");
+        ethPrice = _price;
+    }
+
+    /**
+     * @notice Set lock time
+     * @dev Can only be called by the owner
+     * @param _lockTime lock time in seconds
+     */
+    function setLockTime(uint256 _lockTime) external onlyOwner {
+        require(_lockTime > 0, "TIME_0");
+        lockTime = _lockTime;
+    }
+
+    function setFeeAddress(address payable _feeAddress) public onlyOwner {
+        feeAddress = _feeAddress;
+        emit FeeAddressSet(msg.sender, _feeAddress);
+    }
+
+    function setFee(uint256 _fee) public onlyOwner {
+        require(_fee <= uint256(9000), "FEE_TOO_HIGH");
+        fee = _fee;
+        emit FeeSet(msg.sender, _fee);
+    }
+
+    /**
+     * @notice Rescue dust resulted from swaps/liquidity
+     * @dev Can only be called by the owner
+     */
+    function rescueDust() public onlyOwner {
+        if (ethDust > 0) {
+            treasuryAddress.transfer(ethDust);
+            treasueryEthDust = treasueryEthDust.add(ethDust);
+            emit RescuedDust("ETH", ethDust);
+            ethDust = 0;
+        }
+    }
+
+    /**
+     * @notice Rescue any non-reward token that was airdropped to this contract
+     * @dev Can only be called by the owner
+     */
+    function rescueAirdroppedTokens(address _token, address to)
+        public
+        onlyOwner
+    {
+        require(_token != address(0), "token_0x0");
+        require(to != address(0), "to_0x0");
+        require(_token != forceToken, "rescue_reward_error");
+
+        uint256 balanceOfToken = IERC20(_token).balanceOf(address(this));
+        require(balanceOfToken > 0, "balance_0");
+
+        require(IERC20(_token).transfer(to, balanceOfToken), "rescue_failed");
+    }
+
+    /**
+     * @notice Check if user can withdraw based on current lock time
+     * @param user Address of the user
+     * @return true or false
+     */
+    function isWithdrawalAvailable(address user) public view returns (bool) {
+        if (lockTime > 0) {
+            return userInfo[user].timestamp.add(lockTime) <= block.timestamp;
+        }
+        return true;
+    }
+
+    /**
+     * @notice Deposit to this strategy for rewards
+     * @param deadline Number of blocks until transaction expires
+     * @return Amount of dToken
+     */
+    function deposit(uint256 deadline)
+        public
+        payable
+        nonReentrant
+        returns (uint256)
+    {
+        // -----
+        // validate
+        // -----
+        _defend();
+        require(msg.value > 0, "ETH_0");
+        require(deadline >= block.timestamp, "DEADLINE_ERROR");
+        require(totalEth.add(msg.value) <= cap, "CAP_REACHED");
+
+        DepositData memory results;
+        UserInfo storage user = userInfo[msg.sender];
+
+        if (user.amountdToken == 0) {
+            user.wasUserBlacklisted = blacklisted[msg.sender];
+        }
+        if (user.timestamp == 0) {
+            user.timestamp = block.timestamp;
+        }
+
+        uint256 sentEth = msg.value;
+
+        totalEth = totalEth.add(sentEth);
+
+        user.amountEth = user.amountEth.add(sentEth);
+        // -----
+        // obtain TOKEN from received ETH
+        // -----
+        results.swapPath = new address[](2);
+        results.swapPath[0] = weth;
+        results.swapPath[1] = token;
+
+        results.swapAmounts = sushiswapRouter.swapExactETHForTokens{
+            value: sentEth
+        }(uint256(0), results.swapPath, address(this), deadline);
+
+        results.obtainedToken = results.swapAmounts[
+            results.swapAmounts.length - 1
+        ];
+
+        user.amountToken = user.amountToken.add(results.obtainedToken);
+
+        // -----
+        // deposit Token into the vault and get dToken
+        // -----
+        IERC20(token).safeIncreaseAllowance(
+            address(vault),
+            results.obtainedToken
+        );
+
+        results.prevdTokenBalance = IERC20(poolToken).balanceOf(address(this));
+        vault.deposit(results.obtainedToken);
+        results.obtaineddToken = (IERC20(poolToken).balanceOf(address(this)))
+            .sub(results.prevdTokenBalance);
+
+        // -----
+        // stake dToken into the NoMintRewardPool
+        // -----
+        IERC20(poolToken).safeIncreaseAllowance(
+            address(rewardPool),
+            results.obtaineddToken
+        );
+        user.amountdToken = user.amountdToken.add(results.obtaineddToken);
+
+        if (!user.wasUserBlacklisted) {
+            user.amountReceiptToken = user.amountReceiptToken.add(
+                results.obtaineddToken
+            );
+            receiptToken.mint(msg.sender, results.obtaineddToken);
+            emit ReceiptMinted(msg.sender, results.obtaineddToken);
+        }
+        rewardPool.stake(results.obtaineddToken);
+
+        emit Deposit(
+            msg.sender,
+            tx.origin,
+            sentEth,
+            results.obtainedToken,
+            results.obtaineddToken
+        );
+
+        if (firstDepositTimestamp == 0) {
+            firstDepositTimestamp = block.timestamp;
+        }
+        if (user.joinTimestamp == 0) {
+            user.joinTimestamp = block.timestamp;
+        }
+        totalDeposits = totalDeposits.add(results.obtaineddToken);
+        rewardPool.getReward(); //transfers rewards to this contract
+
+        user.deposits.push(
+            UserDeposits({
+                timestamp: block.timestamp,
+                amountdToken: results.obtaineddToken
+            })
+        );
+
+        user.underlyingRatio = _getRatio(
+            user.amountdToken,
+            user.amountToken,
+            18
+        );
+        return results.obtaineddToken;
+    }
+
+    function _updateDeposits(
+        bool removeAll,
+        uint256 remainingAmountdToken,
+        address account
+    ) private {
+        UserInfo storage user = userInfo[account];
+        if (removeAll) {
+            delete user.deposits;
+            return;
+        }
+
+        for (uint256 i = user.deposits.length; i > 0; i--) {
+            if (remainingAmountdToken >= user.deposits[i - 1].amountdToken) {
+                remainingAmountdToken = remainingAmountdToken.sub(
+                    user.deposits[i - 1].amountdToken
+                );
+                user.deposits[i - 1].amountdToken = 0;
+            } else {
+                user.deposits[i - 1].amountdToken = user.deposits[i - 1]
+                    .amountdToken
+                    .sub(remainingAmountdToken);
+                remainingAmountdToken = 0;
+            }
+
+            if (remainingAmountdToken == 0) {
+                break;
+            }
+        }
+    }
+
+    /**
+     * @notice Withdraw tokens and claim rewards
+     * @param deadline Number of blocks until transaction expires
+     * @return Amount of ETH obtained
+     */
+    function withdraw(uint256 amount, uint256 deadline)
+        public
+        nonReentrant
+        returns (uint256)
+    {
+        // -----
+        // validation
+        // -----
+        uint256 receiptBalance = receiptToken.balanceOf(msg.sender);
+
+        _defend();
+        require(deadline >= block.timestamp, "DEADLINE_ERROR");
+        require(amount > 0, "AMOUNT_0");
+        UserInfo storage user = userInfo[msg.sender];
+        require(user.amountdToken >= amount, "AMOUNT_GREATER_THAN_BALANCE");
+        if (!user.wasUserBlacklisted) {
+            require(
+                receiptBalance >= user.amountReceiptToken,
+                "RECEIPT_AMOUNT"
+            );
+        }
+        if (lockTime > 0) {
+            require(
+                user.timestamp.add(lockTime) <= block.timestamp,
+                "LOCK_TIME"
+            );
+        }
+
+        WithdrawData memory results;
+        results.prevDustEthBalance = address(this).balance;
+
+        // -----
+        // withdraw from NoMintRewardPool and get dToken back
+        // -----
+        results.prevdTokenBalance = IERC20(poolToken).balanceOf(address(this));
+        IERC20(poolToken).safeIncreaseAllowance(address(rewardPool), amount);
+
+        rewardPool.getReward(); //transfers rewards to this contract
+        results.forceBalance = IERC20(forceToken).balanceOf(address(this));
+        results.rewards = getPendingRewards(msg.sender, amount);
+
+        _updateDeposits(amount == user.amountdToken, amount, msg.sender);
+
+        rewardPool.withdraw(amount);
+
+        results.obtaineddToken = (IERC20(poolToken).balanceOf(address(this)))
+            .sub(results.prevdTokenBalance);
+
+        //not sure if it's possible to get more from the pool so better to protect
+        if (results.obtaineddToken < user.amountdToken) {
+            user.amountdToken = user.amountdToken.sub(results.obtaineddToken);
+            if (!user.wasUserBlacklisted) {
+                user.amountReceiptToken = user.amountReceiptToken.sub(
+                    results.obtaineddToken
+                );
+                receiptToken.burn(msg.sender, results.obtaineddToken);
+                emit ReceiptBurned(msg.sender, results.obtaineddToken);
+            }
+        } else {
+            user.amountdToken = 0;
+            if (!user.wasUserBlacklisted) {
+                receiptToken.burn(msg.sender, user.amountReceiptToken);
+                emit ReceiptBurned(msg.sender, user.amountReceiptToken);
+                user.amountReceiptToken = 0;
+            }
+        }
+
+        // -----
+        // withdraw from the vault and get token back
+        // -----
+        IERC20(poolToken).safeIncreaseAllowance(
+            address(vault),
+            results.obtaineddToken
+        );
+
+        results.prevTokenBalance = IERC20(token).balanceOf(address(this));
+        vault.withdraw(results.obtaineddToken);
+        results.obtainedToken = (IERC20(token).balanceOf(address(this))).sub(
+            results.prevTokenBalance
+        );
+
+        emit ObtainedInfo(
+            msg.sender,
+            results.obtainedToken,
+            results.obtaineddToken
+        );
+
+        results.feeableToken = 0;
+        if (amount == user.amountdToken) {
+            //there is no point to do the ratio math as we can just get the difference between current obtained tokens and initial obtained tokens
+            if (results.obtainedToken > user.amountToken) {
+                results.feeableToken = results.obtainedToken.sub(
+                    user.amountToken
+                );
+            }
+        } else {
+            uint256 currentRatio =
+                _getRatio(results.obtaineddToken, results.obtainedToken, 18);
+            if (currentRatio < user.underlyingRatio) {
+                uint256 noOfOriginalTokensForCurrentAmount =
+                    (amount.mul(10**18)).div(user.underlyingRatio);
+                if (
+                    noOfOriginalTokensForCurrentAmount < results.obtainedToken
+                ) {
+                    results.feeableToken = results.obtainedToken.sub(
+                        noOfOriginalTokensForCurrentAmount
+                    );
+                }
+            }
+        }
+        if (results.feeableToken > 0) {
+            uint256 extraTokensFee = _calculateFee(results.feeableToken);
+            emit ExtraTokens(
+                msg.sender,
+                results.feeableToken.sub(extraTokensFee)
+            );
+            user.earnedTokens = user.earnedTokens.add(
+                results.feeableToken.sub(extraTokensFee)
+            );
+        }
+
+        //not sure if it's possible to get more from Force so better to protect
+
+        if (results.obtainedToken <= user.amountToken) {
+            user.amountToken = user.amountToken.sub(results.obtainedToken);
+        } else {
+            user.amountToken = 0;
+        }
+
+        results.obtainedToken = results.obtainedToken.sub(results.feeableToken);
+
+        // -----
+        // swap TOKEN to ETH
+        // -----
+        address[] memory swapPath = new address[](2);
+        swapPath[0] = token;
+        swapPath[1] = weth;
+        if (results.obtainedToken > 0) {
+            IERC20(token).safeIncreaseAllowance(
+                address(sushiswapRouter),
+                results.obtainedToken.add(results.feeableToken)
+            );
+            uint256[] memory tokenSwapAmounts =
+                sushiswapRouter.swapExactTokensForETH(
+                    results.obtainedToken,
+                    uint256(0),
+                    swapPath,
+                    address(this),
+                    deadline
+                );
+            results.totalEth = results.totalEth.add(
+                tokenSwapAmounts[tokenSwapAmounts.length - 1]
+            );
+        }
+
+        if (results.feeableToken > 0) {
+            uint256[] memory tokenFeeableSwapAmounts =
+                sushiswapRouter.swapExactTokensForETH(
+                    results.feeableToken,
+                    uint256(0),
+                    swapPath,
+                    address(this),
+                    deadline
+                );
+
+            emit ExtraTokensExchanged(
+                msg.sender,
+                results.feeableToken,
+                tokenFeeableSwapAmounts[tokenFeeableSwapAmounts.length - 1]
+            );
+            results.feeableEth = results.feeableEth.add(
+                tokenFeeableSwapAmounts[tokenFeeableSwapAmounts.length - 1]
+            );
+        }
+
+        uint256 transferableRewards = results.rewards;
+        if (transferableRewards > results.forceBalance) {
+            transferableRewards = results.forceBalance;
+        }
+
+        if (transferableRewards > 0) {
+            emit RewardsEarned(msg.sender, transferableRewards);
+            user.earnedRewards = user.earnedRewards.add(transferableRewards);
+
+            swapPath[0] = forceToken;
+
+            IERC20(forceToken).safeIncreaseAllowance(
+                address(sushiswapRouter),
+                transferableRewards
+            );
+
+            uint256[] memory rewardSwapAmounts =
+                sushiswapRouter.swapExactTokensForETH(
+                    transferableRewards,
+                    uint256(0),
+                    swapPath,
+                    address(this),
+                    deadline
+                );
+
+            emit RewardsExchanged(
+                msg.sender,
+                transferableRewards,
+                rewardSwapAmounts[rewardSwapAmounts.length - 1]
+            );
+
+            results.feeableEth = results.feeableEth.add(
+                rewardSwapAmounts[rewardSwapAmounts.length - 1]
+            );
+        }
+
+        // -----
+        // transfer ETH to usert
+        // -----
+        results.auctionedEth = results.feeableEth.div(2);
+        results.feeableEth = results.feeableEth.sub(results.auctionedEth);
+        results.totalEth = results.totalEth.add(results.feeableEth);
+
+        totalDeposits = totalDeposits.sub(results.obtaineddToken);
+        if (user.amountdToken == 0) //full exit
+        {
+            //if user exits to early, obtained ETH might be lower than what user initially invested and there will be some left in amountEth
+            //making sure we reset it
+            user.amountEth = 0;
+        } else {
+            if (user.amountEth > results.totalEth) {
+                user.amountEth = user.amountEth.sub(results.totalEth);
+            } else {
+                user.amountEth = 0;
+            }
+        }
+
+        if (results.totalEth < totalEth) {
+            totalEth = totalEth.sub(results.totalEth);
+        } else {
+            totalEth = 0;
+        }
+
+        //at some point we might not have any fees
+        if (fee > 0) {
+            uint256 feeEth = _calculateFee(results.totalEth);
+            results.totalEth = results.totalEth.sub(feeEth);
+
+            feeAddress.transfer(feeEth);
+            user.userCollectedFees = user.userCollectedFees.add(feeEth);
+        }
+
+        msg.sender.transfer(results.totalEth);
+        treasuryAddress.transfer(results.auctionedEth);
+        user.userTreasuryEth = user.userTreasuryEth.add(results.auctionedEth);
+
+        emit Withdraw(
+            msg.sender,
+            tx.origin,
+            results.totalEth,
+            results.obtainedToken,
+            results.obtaineddToken,
+            results.auctionedEth
+        );
+
+        ethDust = ethDust.add(
+            address(this).balance.sub(results.prevDustEthBalance)
+        );
+
+        if (user.amountdToken == 0 || user.amountToken == 0) {
+            user.underlyingRatio = 0;
+        } else {
+            user.underlyingRatio = _getRatio(
+                user.amountdToken,
+                user.amountToken,
+                18
+            );
+        }
+
+        return results.totalEth;
+    }
+
+    /// @notice Transfer rewards to this strategy
+    function updateReward() public onlyOwner {
+        rewardPool.getReward();
+    }
+
+    function _defend() private view returns (bool) {
+        require(
+            approved[msg.sender] || msg.sender == tx.origin,
+            "access_denied"
+        );
+    }
+
+    function _calculateFee(uint256 amount) private view returns (uint256) {
+        return (amount.mul(fee)).div(feeFactor);
+    }
+
+    //-----------------------------------------------------------------------------------------------------------------//
+    //------------------------------------ Getters -------------------------------------------------//
+    //-----------------------------------------------------------------------------------------------------------------//
+    /**
+     * @notice View function to see pending rewards for account.
+     * @param account user account to check
+     * @param amount amount you want to calculate for; if 0 will calculate for entire amount
+     * @return pending rewards
+     */
+    function getPendingRewards(address account, uint256 amount)
+        public
+        view
+        returns (uint256)
+    {
+        UserInfo storage user = userInfo[account];
+
+        if (amount == 0) {
+            amount = user.amountdToken;
+        }
+        if (user.deposits.length == 0 || user.amountdToken == 0) {
+            return 0;
+        }
+
+        uint256 rewards = 0;
+        uint256 remaingAmount = amount;
+
+        uint256 i = user.deposits.length - 1;
+        while (remaingAmount > 0) {
+            uint256 depositRewards =
+                _getPendingRewards(user.deposits[i], remaingAmount);
+
+            rewards = rewards.add(depositRewards);
+
+            if (remaingAmount >= user.deposits[i].amountdToken) {
+                remaingAmount = remaingAmount.sub(
+                    user.deposits[i].amountdToken
+                );
+            } else {
+                remaingAmount = 0;
+            }
+
+            if (i == 0) {
+                break;
+            }
+            i = i.sub(1);
+        }
+
+        return rewards;
+    }
+
+    function _getPendingRewards(
+        UserDeposits memory user,
+        uint256 remainingAmount
+    ) private view returns (uint256) {
+        if (user.amountdToken == 0) {
+            return 0;
+        }
+        uint256 toCalculateForAmount = 0;
+        if (user.amountdToken <= remainingAmount) {
+            toCalculateForAmount = user.amountdToken;
+        } else {
+            toCalculateForAmount = remainingAmount;
+        }
+
+        uint256 rewardPerBlock = 0;
+        uint256 balance = IERC20(forceToken).balanceOf(address(this));
+        if (balance == 0) {
+            return 0;
+        }
+        uint256 diff = block.timestamp.sub(firstDepositTimestamp);
+        if (diff == 0) {
+            rewardPerBlock = balance;
+        } else {
+            rewardPerBlock = balance.div(diff);
+        }
+        uint256 rewardPerBlockUser =
+            rewardPerBlock.mul(block.timestamp.sub(user.timestamp));
+        uint256 ratio = _getRatio(toCalculateForAmount, totalDeposits, 18);
+        return (rewardPerBlockUser.mul(ratio)).div(10**18);
+    }
+
+    function _getRatio(
+        uint256 numerator,
+        uint256 denominator,
+        uint256 precision
+    ) private pure returns (uint256) {
+        uint256 _numerator = numerator * 10**(precision + 1);
+        uint256 _quotient = ((_numerator / denominator) + 5) / 10;
+        return (_quotient);
+    }
+
+    receive() external payable {}
+}

@@ -1,0 +1,40 @@
+{
+  "name": "polkastrategies_launchpad",
+  "scripts": {
+    "deploy:mainnet": "hardhat --network mainnet deploy",
+    "deploy:polygon": "hardhat --network polygon deploy",
+    "deploy:mumbai": "hardhat --network mumbai deploy",
+    "deploy:kovan": "hardhat --network kovan deploy",
+    "deploy:rinkeby": "hardhat --network rinkeby deploy",
+    "deploy:ganache": "hardhat --network ganache deploy"
+  },
+  "devDependencies": {
+    "@nomiclabs/hardhat-ethers": "^2.0.2",
+    "@nomiclabs/hardhat-etherscan": "^2.1.5",
+    "@nomiclabs/hardhat-waffle": "^2.0.1",
+    "@openzeppelin/contracts": "^4.0.0",
+    "@types/chai": "^4.2.16",
+    "@types/mocha": "^8.2.2",
+    "@types/node": "^14.14.41",
+    "chai": "^4.3.4",
+    "cross-env": "^7.0.0",
+    "dotenv": "^8.2.0",
+    "ethereum-waffle": "^3.3.0",
+    "ethers": "^5.1.3",
+    "hardhat": "^2.2.0",
+    "hardhat-gas-reporter": "^1.0.4",
+    "ts-node": "^9.1.1",
+    "typescript": "^4.2.4"
+  },
+  "dependencies": {
+    "@aave/protocol-v2": "^1.0.1",
+    "@maticnetwork/maticjs": "^2.0.38",
+    "@openzeppelin/contracts-upgradeable": "^4.1.0",
+    "@studydefi/money-legos": "^2.4.2",
+    "ethereumjs-util": "^7.0.10",
+    "ethereumjs-wallet": "^1.0.1",
+    "hardhat-abi-exporter": "^2.2.1",
+    "hardhat-deploy": "^0.7.6",
+    "hardhat-deploy-ethers": "^0.3.0-beta.7"
+  }
+}

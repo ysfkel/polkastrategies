@@ -1,0 +1,41 @@
+// // SPDX-License-Identifier: MIT
+// pragma solidity 0.8.1;
+
+// import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+// import "../interfaces/IHarvestVault.sol";
+
+// import "./FakeToken.sol";
+
+// contract HarvestVaultMock is IHarvestVault {
+//     address public token;
+//     address public fToken;
+
+//     constructor(address _token, address _fToken) public {
+//         token = _token;
+//         fToken = _fToken;
+//     }
+
+//     function deposit(uint256 amount) external override {
+//         IERC20(token).transferFrom(msg.sender, address(this), amount);
+//         FakeToken(fToken).mint(msg.sender, (amount * 2));
+//     }
+
+//     function withdraw(uint256 numberOfShares) external override {
+//         FakeToken(fToken).burn(msg.sender, numberOfShares);
+
+//         uint256 toTransfer = numberOfShares / 2;
+//         uint256 extra10Percent = _calcExtra(toTransfer);
+//         toTransfer = toTransfer + extra10Percent;
+
+//         uint256 crtBalance = IERC20(token).balanceOf(address(this));
+//         if (crtBalance < toTransfer) {
+//             FakeToken(token).mint(address(this), (toTransfer - crtBalance));
+//         }
+
+//         IERC20(token).transfer(msg.sender, toTransfer);
+//     }
+
+//     function _calcExtra(uint256 amount) internal view returns (uint256) {
+//         return (amount * 1000) / 10000;
+//     }
+// }
